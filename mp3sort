@@ -1,0 +1,189 @@
+#!/usr/bin/ruby
+
+require 'ftools'
+require 'find'
+
+#
+#	Returns an array of all regular files in 'basedir' and its subdirs
+#	and counts the number of directories encountered
+#
+def generate_filelist(basedir)
+	filelist = Array.new
+	directory_counter = 0
+	Find.find(basedir) do |path|
+		if(File.file?(path))
+			filelist << path
+		elsif(FileTest.directory?(path))
+			directory_counter = directory_counter + 1
+		end
+	end
+	return filelist, directory_counter
+end
+
+#
+#	Returns hash containing id3v2.4-frames found in 'filename'
+#
+def get_id3tag(filename)
+	# Escape filename with \ since we will call a shell to run mid3v2 and
+	# shells don't accept spaces and " etc. in filenames on the commandline
+    filename = filename.to_s.gsub(/[^A-Za-z0-9\_\-\.\:\,\/\@\x1b\x80-\xfe]/n) { |x| "\\#{x}" }
+
+	mid3v2 = IO.popen("/usr/bin/mid3v2 -Csl " + filename ) # -C convert to id3v2.4, -s delete id3v1 tag, -l list info
+    result = mid3v2.readlines
+	mid3v2.close
+
+	# 2-line results mean that mid3v2 is either saying
+	# - "'<filename>' doesn't start with an ID3 tag" ... or
+	# - "[Errno 2] No such file or directory: '<filename>'" ... or maybe
+	# - "[Errno 13] Permission denied: '<filename>'
+	# Whatever the error, we return nil since we have no id3tag to return
+	return nil if result.size == 2
+
+	# Extract all lines containing an id3v2.4 frame and store them in hash
+	# This implementation is very flawed since only the last tag of any
+	# given type will be returned (it's a hash stupid!). But for our current
+	# needs this is acceptable.
+	id3tag = Hash.new
+	result.each do |result_line|
+		next if not result_line =~ /[A-Z0-9]{4,4}=/ # Valid ID3v2.4 tag
+		id3tag[result_line[0,4]] = result_line[5,result_line.length].chomp
+	end
+	return id3tag
+end
+
+#
+#	Returns a valid POSIX filename with NULL and / stripped
+#
+def generate_valid_posix_name(name)
+	name = name.gsub( /[\000\/]/, '')
+	name = "? "if name.length == 0
+	return name
+end
+
+#
+#	Move file from source to destination
+#
+def move_file(source, destination)
+	# Only try to move if source exists and is regular file
+	return false if !File.file?(source)
+
+	# Create destination directory if it does not already exist
+	if !File.directory?(File.dirname(destination))
+		File.makedirs(File.dirname(destination))
+	end
+
+	# If source and destination are identical, do not move
+	return false if File.identical?(source, destination)
+
+	# Attempt move
+	result = File.move(source, destination)
+
+	return result
+end
+
+def	remove_empty_dirs(basedir)
+	Find.find(basedir) do |path|
+		if(File.directory?(path))
+			Dir.delete(path) if Dir.entries(path).length == 2
+		end
+	end
+	
+end
+
+def main
+	# Usage information
+	if !ARGV[0] 
+		puts "\nMP3Sort 0.1 - Sorts/re-sorts an MP3 directory structure according to artist and album\n\n"
+		puts "Usage: mp3sort <directory structure to sort>\n\n"
+		exit
+	else
+		basedir = ARGV[0]
+		if !File.exists?(basedir) 
+			puts "mp3sort: " + basedir + ": Unknown directory\n"
+			exit
+		end
+		if !File.directory?(basedir)
+			puts "mp3sort: " + basedir + ": Not a directory\n"
+			exit
+		end
+	end
+
+	# Check for presence of mid3v2
+	mid3v2 = IO.popen("/usr/bin/mid3v2 --version")
+	  result = mid3v2.readlines
+	mid3v2.close
+	if !(result[0] =~ /mid3v2/)
+		puts "mp3sort: required helper mid3v2 does not seem to be installed\n"
+		exit
+	end
+
+	# Initial find on all files i directory structure
+	puts "Analyzing directory structure..."
+	filelist, directory_counter = generate_filelist(basedir)
+	puts "Found #{filelist.length} files in #{directory_counter} directories\n"
+
+	# Processing of individual files
+	skipped_files = Array.new # Keep track of files without ID3-tag
+	filelist.each do |file|
+		id3tag = get_id3tag(file)
+
+		if id3tag == nil # If not music file or file without ID3 tag
+			puts "Ignoring " + File.basename(file)
+			skipped_files << file
+		else
+			# Find artist - prefer TPE1 over TPE2
+			if id3tag.has_key?("TPE1") && id3tag["TPE1"].length > 0
+				artist = generate_valid_posix_name(id3tag["TPE1"])
+			elsif id3tag.has_key?("TPE2") && id3tag["TPE2"].length > 0
+				artist = generate_valid_posix_name(id3tag["TPE2"])
+			else
+				artist = "Unknown Artist"
+			end
+			# Find albumartist - prefer TPE2 over TPE1
+			if id3tag.has_key?("TPE2") && id3tag["TPE2"].length > 0
+				albumartist = generate_valid_posix_name(id3tag["TPE2"])
+			elsif 
+				albumartist = generate_valid_posix_name(id3tag["TPE1"])
+			else
+				albumartist = "Unknown Artist"
+			end
+			# Convert album title to directory name
+			if id3tag.has_key?("TALB") && id3tag["TALB"].length > 0
+				album = generate_valid_posix_name(id3tag["TALB"])
+			else
+				album = "Unknown Album"
+			end
+			# Convert song title to filename
+			if id3tag.has_key?("TIT2") && id3tag["TIT2"].length > 0
+				title = generate_valid_posix_name(id3tag["TIT2"])
+			else
+				title = "Unknown Title"
+			end
+			
+			title = artist + " - " + title + File.extname(file)
+
+			# Move file and print result
+			if move_file(file, basedir + "/" + albumartist + "/" + album + "/" + title)
+				puts "Moved " + id3tag["TIT2"] + " by " + id3tag["TPE1"]
+			else
+				puts "Skipping " + id3tag["TIT2"] + " by " + id3tag["TPE1"]
+			end
+		end
+	end
+
+	# Write a list of skipped files to 'skipped.log' in root of 'basedir'
+	puts "Writing list of ignored files to ignored.log"
+	file = File.new(basedir + "/ignored.log", "w+")
+	skipped_files.each do |line|
+		file.puts line
+	end
+	file.close
+
+	# Remove empty directories
+	puts "Cleaing up empty directories"
+	remove_empty_dirs(basedir)
+
+	puts "Done!"
+end
+
+main
